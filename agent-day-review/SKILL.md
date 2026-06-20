@@ -37,10 +37,12 @@ skill 接受的 slash arg：
 | `/agent-day-review --dry-run` | 只列印「將要 append 的 callout 內容」+ 「state file 將更新成什麼」，**不寫任何檔案** |
 | `/agent-day-review dry-run` | 同上（容錯，不要求 `--`） |
 | `/agent-day-review --since=YYYY-MM-DDTHH:MM:SSZ` | 強制覆寫 state file 的 `last_processed_ts`，從指定時間點重新處理（debug / 補跑用） |
+| `/agent-day-review --file=<path>` | 指定／重新指定 callout 要寫入的檔案；命中後記住於 state file（見 Phase F1） |
 
 env var 仍支援（給 cron / launchd 使用）：
 - `AGENT_REVIEW_DRY_RUN=1` 等同 `--dry-run`
 - `AGENT_REVIEW_SINCE=...` 等同 `--since=...`
+- `AGENT_REVIEW_FILE=<path>` 等同 `--file=...`
 
 設一個 `DRY_RUN=0/1` flag，在 Phase F (寫檔) 和 Phase G (寫 state) 前 short-circuit。
 
@@ -56,11 +58,14 @@ Schema：
 {
   "last_run_iso": "2026-05-02T10:30:00Z",
   "claude_code_last_processed_ts": "2026-05-02T10:30:00Z",
-  "cursor_last_processed_ts": "2026-05-02T10:30:00Z"
+  "cursor_last_processed_ts": "2026-05-02T10:30:00Z",
+  "cycle_log_file": "/absolute/path/to/current-cycle-log.md"
 }
 ```
 
-不存在或欄位缺：預設 **今天 00:00 Asia/Taipei** 對應的 UTC（避免第一次跑就回溯一週）。
+`cycle_log_file`：上次解析定案的目標檔絕對路徑（Phase F1 順序 4 問到後寫入）。不存在代表還沒問過。
+
+時間戳欄位不存在或缺：預設 **今天 00:00 Asia/Taipei** 對應的 UTC（避免第一次跑就回溯一週）。
 用 `python3 -c "from datetime import datetime, timezone, timedelta; tz=timezone(timedelta(hours=8)); now=datetime.now(tz); midnight=now.replace(hour=0,minute=0,second=0,microsecond=0); print(midnight.astimezone(timezone.utc).isoformat())"` 取當日 0 點。
 
 ### Phase B：增量掃 sessions
@@ -229,110 +234,71 @@ PROMPTS:
 
 把所有 subagent 回傳的 bullet 合併。如果加總 > 2000 字，按比例 trim 每個 cwd 的最末 task。**不在 parent 重寫內容**（保訊息保真）。
 
-### Phase F：找 cycle log + insert callout
+### Phase F：解析目標檔 + insert callout
 
-#### F1. Discover cycle log
+#### F1. 解析要寫入的檔案
+
+callout 要 append 到哪個檔，按以下順序解析（**第一個命中為準**）：
+
+| 順序 | 來源 | 說明 |
+|---|---|---|
+| 1 | `--file=<path>` arg | 明確指定／重新指定。命中後寫回 state file |
+| 2 | `AGENT_REVIEW_FILE` 環境變數 | 給 cron / launchd 用（等同「明確指定」） |
+| 3 | state file 的 `cycle_log_file` | 上次記住的答案 |
+| 4 | **互動詢問使用者** | 前三者皆無時，問使用者要寫去哪個檔。**得到答案後寫回 state file**，下次起走順序 3 |
+| 5 | 非互動且前四者皆無 | **報錯退出，不靜默寫檔**（見「失敗模式」） |
 
 ```python
-import glob, re, os
-from datetime import datetime, timezone, timedelta, date
+import os
 
-# 週號慣例錨點(使用者自訂):W18 起始 = 2026-04-26(週日);雙週一檔、週日起算。
-# 檔名週號與 frontmatter 日期皆以此為唯一真相,兩者不得各自為政。
-ANCHOR_SUNDAY = date(2026, 4, 26)
-ANCHOR_WEEK = 18
-
-def week_range_from_filename(fp):
-    """無 frontmatter 時,由檔名 W<lo>-<hi> 經錨點反推 (start, end) 日期。"""
-    m = re.search(r"W(\d+)-(\d+)\.md$", fp)
-    if not m:
-        return None
-    lo = int(m.group(1))
-    start = ANCHOR_SUNDAY + timedelta(days=(lo - ANCHOR_WEEK) * 7)
-    return start, start + timedelta(days=13)
-
-today_taipei = datetime.now(timezone(timedelta(hours=8))).date()
-candidates = glob.glob(os.path.expanduser("~/morphe/0 Inbox/*Q*W*-*.md"))
 target = None
-for fp in candidates:
-    with open(fp) as f:
-        head = "".join(f.readline() for _ in range(5))
-    sm = re.search(r"start-date:\s*(\d{4}-\d{2}-\d{2})", head)
-    em = re.search(r"end-date:\s*(\d{4}-\d{2}-\d{2})", head)
-    if sm and em:
-        s = datetime.fromisoformat(sm.group(1)).date()
-        e = datetime.fromisoformat(em.group(1)).date()
-    else:
-        # fallback:空殼檔(缺 frontmatter)改用檔名週號反推範圍,
-        # 避免被略過而觸發 F2 誤建出週號 +2 的重複檔。
-        rng = week_range_from_filename(fp)
-        if not rng:
-            continue
-        s, e = rng
-    if s <= today_taipei <= e:
-        target = fp; break
+if file_arg:                                    # 來自 --file=
+    target = file_arg
+elif os.environ.get("AGENT_REVIEW_FILE"):
+    target = os.environ["AGENT_REVIEW_FILE"]
+elif state.get("cycle_log_file"):
+    target = state["cycle_log_file"]
+
+if target:
+    target = os.path.abspath(os.path.expanduser(target))
+# else → 走 F1b
 ```
 
-#### F2. Not found → create
+**F1b（`target` 仍為 None）**：
+
+- **互動執行**：問使用者「這次的 review 要 append 到哪個檔案？給我絕對路徑」，取得後設給 `target`。
+- **非互動執行**（cron / `--no-interactive` / 手機 dispatch 無人應答）：印出明確錯誤後**退出，不寫任何檔**：
+  ```
+  agent-day-review: 無 target 檔案。請用 --file=<path>、設 AGENT_REVIEW_FILE 環境變數，
+  或先互動跑一次以記住路徑。
+  ```
+
+凡經由 **arg / env / 互動詢問**取得的 `target`，都要**寫回 state file 的 `cycle_log_file`**（見 Phase G），使後續（含自動）執行沿用，直到使用者再以 `--file=` 重新指定。
+
+> 注意：記住的是**單一檔案**，不會隨雙週自動換檔。進入新 cycle、要寫新檔時，使用者需以 `--file=<新檔>` 重新指定一次（之後再記住新值）。
+
+#### F2. 確保檔案存在
 
 ```python
-if not target:
-    # 算今天前一個（含）週日。Python 的 weekday() Mon=0...Sun=6
-    days_since_sun = (today_taipei.weekday() + 1) % 7  # Sun=0
-    start = today_taipei - timedelta(days=days_since_sun)
-    end = start + timedelta(days=13)
-    
-    # 檔名週號由 start 經錨點推算,與上面的 frontmatter 日期保證一致。
-    # (不再掃描舊檔名取最大 W——那會讓任何一次錯標的週號往後每兩週複製一次。)
-    week_offset = (start - ANCHOR_SUNDAY).days // 7
-    new_lo = ANCHOR_WEEK + week_offset
-    new_hi = new_lo + 1
-    
-    # Quarter from start month
-    quarter = (start.month - 1) // 3 + 1
-    
-    fname = f"{start.year}Q{quarter} W{new_lo:02d}-{new_hi:02d}.md"
-    target = os.path.expanduser(f"~/morphe/0 Inbox/{fname}")
-    
-    # 防覆寫:同名檔已存在(例如先前手建的空殼)→ 直接沿用,交給 F3/F4 append,
-    # 絕不 open(target,"w") 清掉既有內容。
-    if not os.path.exists(target):
-        # Build content: 14 day headings reverse chrono
-        lines = [
-            "---",
-            f"start-date: {start.isoformat()}",
-            f"end-date: {end.isoformat()}",
-            "---",
-            "# Cycle Plan",
-            "",
-            "",
-            "# Cycle Review",
-            "",
-            "",
-            "# Log",
-            "",
-        ]
-        for offset in range(13, -1, -1):
-            d = start + timedelta(days=offset)
-            # ddd = abbreviated weekday name (Sun, Mon, ..., Sat)
-            ddd = d.strftime("%a")
-            lines.append("")
-            lines.append(f"## {d.isoformat()} ({ddd})")
-            lines.append("")
-        
-        with open(target, "w") as f:
-            f.write("\n".join(lines) + "\n")
+if not os.path.exists(target):
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    # 建最小骨架：只放一個 Log 標題，當天 heading 交給 F3 補。
+    # 絕不覆寫既有檔（這個分支只在檔不存在時進入）。
+    with open(target, "w") as f:
+        f.write("# Log\n")
 ```
 
-#### F3. Find day heading
+#### F3. Find / create day heading
 
-`## YYYY-MM-DD (ddd)`，例如 `## 2026-05-02 (Sat)`。
+找 `## YYYY-MM-DD (ddd)` heading，例如 `## 2026-05-02 (Sat)`（`ddd` 為 Asia/Taipei 當天的星期縮寫）。
 
-如果 cycle log 內找不到該 heading（理論上不應發生，因為建檔時 14 天都展開）→ 在最後一個 `## ...` heading 之後（或 `# Cycle Review` 之前）補插。
+找不到（新檔、或當天首次寫入——現在是常態，不是例外）→ append 一個新的 day heading 到檔末，再於其下插 callout。若檔內已有其他 `## ` day heading，插在日期順序的合適位置；判斷不了就直接 append 檔末。
 
 #### F4. Insert callout
 
-從 today heading 開始，找該段落「最末尾」（下一個 `## ` heading 或 `# Cycle Review` 前一行）。在那位置 append（前面留一行空行隔開既有內容）：
+從 today heading 開始，找該段落「最末尾」（下一個 `## ` 或 `# ` heading 前一行，皆無則檔末）。在那位置 append（前面留一行空行隔開既有內容）：
 
 ```
 >[!Note] Agent 協作回顧 ({HH:MM})
@@ -351,11 +317,14 @@ if not target:
 {
   "last_run_iso": "<now UTC iso>",
   "claude_code_last_processed_ts": "<now UTC iso>",
-  "cursor_last_processed_ts": "<now UTC iso>"
+  "cursor_last_processed_ts": "<now UTC iso>",
+  "cycle_log_file": "<Phase F1 解析到的 target 絕對路徑>"
 }
 ```
 
 兩個 source 都統一用 `now`（簡化；下次跑時兩個 source 都從這個點往後）。
+
+`cycle_log_file`：把 Phase F1 經 arg / env / 互動詢問取得的 `target` 寫回（**保留**既有值，除非這次有新指定）。state file 若已有舊值而這次走順序 3 沿用，原樣寫回即可。
 
 ---
 
@@ -388,6 +357,7 @@ if not target:
 |---|---|---|
 | `--dry-run` / `AGENT_REVIEW_DRY_RUN=1` | off | 不寫檔，只印出將要 append 的 callout |
 | `--since=ISO_TS` / `AGENT_REVIEW_SINCE` | 從 state file 讀 | 強制覆寫起始時間（debug / 補跑） |
+| `--file=PATH` / `AGENT_REVIEW_FILE` | 從 state file 讀；無則互動詢問 | callout 寫入的目標檔（見 Phase F1） |
 | `AGENT_REVIEW_BUDGET=N` | 2000 | 字數上限
 
 ---
@@ -396,15 +366,16 @@ if not target:
 
 | 情境 | 行為 |
 |---|---|
-| state file 不存在 | 從今天 00:00 (Asia/Taipei) 開始 |
+| state file 不存在 | 時間戳從今天 00:00 (Asia/Taipei) 開始；`cycle_log_file` 視為未設，走 F1 解析 |
 | 沒有任何 session 在區間內 | 寫單行 callout `(本時段無實質 agent 協作)` |
 | Subagent 全回 `(本 cwd 無實質互動)` | 同上 |
-| Cycle log 不存在 | 用 template 建新檔，14 天 heading 完整展開 |
-| 跨 cycle 邊界（今天剛跨進新 cycle） | 自動建新 cycle log |
-| 跨 quarter 邊界 | 用 start-date 的 quarter |
+| **無法解析 target 且非互動執行** | **報錯退出，不寫任何檔**（見 F1b） |
+| 目標檔不存在 | 建最小骨架（只含 `# Log`），不覆寫既有檔（F2） |
+| 目標檔缺當天 day heading | append 新 heading 再插 callout（F3，常態） |
+| target 來自互動詢問 / arg / env | 寫回 state file `cycle_log_file`，後續沿用 |
 | 同 cwd 一天內 > 30 prompts | 截近 30 條送 subagent |
 | Cursor timestamp parse 失敗 | 跳過該訊息，不終止 |
-| 寫 cycle log 衝突（dump 同時跑） | append-only，理論不衝；若 conflict edit 失敗 → 1 秒重試 1 次 |
+| 寫目標檔衝突（dump 同時跑） | append-only，理論不衝；若 conflict edit 失敗 → 1 秒重試 1 次 |
 
 ---
 
@@ -418,11 +389,17 @@ if not target:
 
 ## Cron / 自動觸發（不在 skill 內，使用者自設）
 
+**自動執行（`--no-interactive`）必須先有可解析的 target**——它無法互動詢問。兩種做法擇一：
+1. 在 cron/launchd 環境設 `AGENT_REVIEW_FILE=<path>`（最穩，明確）。
+2. 先互動跑一次（會問你要寫哪個檔並記住），之後自動執行沿用 state file 的 `cycle_log_file`。
+
+兩者皆無 → 自動執行會**報錯退出、不寫檔**（刻意：不靜默寫去錯的地方）。
+
 範例 launchd 或 cron：
 ```
-0 20,23 * * * /usr/local/bin/claude --no-interactive "/agent-day-review" >> ~/.claude/skill-state/agent-day-review/cron.log 2>&1
+0 20,23 * * * AGENT_REVIEW_FILE="$HOME/path/to/current-cycle-log.md" /usr/local/bin/claude --no-interactive "/agent-day-review" >> ~/.claude/skill-state/agent-day-review/cron.log 2>&1
 ```
 
-或手動 `/agent-day-review`。
+或手動 `/agent-day-review`（首次會問檔案，之後記住）。進入新 cycle 要換檔時：`/agent-day-review --file=<新檔>`。
 
-手機 Claude Code dispatch 同樣打 `/agent-day-review`。
+手機 Claude Code dispatch 同樣打 `/agent-day-review`（需 state file 已有 `cycle_log_file`，否則無人應答會報錯）。

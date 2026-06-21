@@ -35,8 +35,8 @@ user-invocable: true
 
 ## 不該用
 
-- 對方要的是**翻譯**整篇英文 → 用 `translate-md`
-- 對方要的是 markdown → PDF / EPUB 轉檔 → 用 `pdf-tools` / `md-to-pdf`
+- 對方要的是**翻譯**整篇英文 → 為對方尋找替代方案
+- 對方要的是 markdown → PDF / EPUB 轉檔 → 用 `pdf-tools` / 為對方尋找替代方案
 - 程式碼註解、commit message、技術文件本來就慣用英文 → 不動
 
 ---
